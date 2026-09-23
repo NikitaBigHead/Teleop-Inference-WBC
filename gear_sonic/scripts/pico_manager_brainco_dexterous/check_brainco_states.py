@@ -25,7 +25,7 @@ FINGER_NAMES = [
 ]
 
 SAMPLES_PER_HAND = 3
-STATE_TIMEOUT_SEC = 3.0
+STATE_TIMEOUT_SEC = 10.0
 
 
 def print_states(hand_name, msg, sample_num):
@@ -54,10 +54,14 @@ def check_hand(hand_name, topic):
 
     try:
         while received_samples < SAMPLES_PER_HAND and time.monotonic() < deadline:
-            msg = subscriber.Read()
+            # Read() without a timeout blocks indefinitely in unitree_sdk2py.
+            # Bound every DDS read by the remaining per-hand deadline.
+            remaining_sec = deadline - time.monotonic()
+            if remaining_sec <= 0:
+                break
+            msg = subscriber.Read(timeout=remaining_sec)
 
             if msg is None:
-                time.sleep(0.01)
                 continue
 
             if len(msg.states) < len(FINGER_NAMES):
@@ -97,6 +101,12 @@ def main():
 
     for hand_name, topic in HAND_TOPICS.items():
         results[hand_name] = check_hand(hand_name, topic)
+        if not results[hand_name]:
+            print(
+                "State check timed out; returning failure so the launcher can "
+                "restart the BrainCo container."
+            )
+            break
 
     print("\nFinal result:")
     for hand_name, ok in results.items():

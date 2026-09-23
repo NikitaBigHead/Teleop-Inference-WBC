@@ -208,7 +208,7 @@ python -m gear_sonic.camera.composed_camera \
   --realsense-width 1280 \
   --realsense-height 720 \
   --head-camera-width 1280 \
-  --head-camera-height 960 \
+  --head-camera-height 720 \
   --head-camera-fps 15 \
   --head-camera-quality 90 \
   --head-camera-fourcc MJPG \
