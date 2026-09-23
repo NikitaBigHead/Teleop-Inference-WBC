@@ -28,17 +28,13 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 """
 
 from dataclasses import dataclass
+import os
 import queue
+import sys as _sys
 import threading
 import time
 
 import numpy as np
-import os  # AGENT-PATCH
-import sys as _sys  # AGENT-PATCH
-_sys.path.insert(0, os.path.expanduser('~'))  # AGENT-PATCH
-from tactile_agent import TactileAgent  # AGENT-PATCH
-import os  # PROBE-PATCH
-import sys as _sys  # PROBE-PATCH
 _sys.path.append(os.path.expanduser('~'))  # PROBE-PATCH
 from chunk_probe import ChunkProbe  # PROBE-PATCH
 import tyro
@@ -278,18 +274,19 @@ def _slew_limit(token):  # SLEW-PATCH
         return token
 
 
-_slew_hand_prev = [None]  # SLEW-PATCH
+_slew_hand_prev = {"left": None, "right": None}  # SLEW-PATCH
 
 
-def _slew_hand(vec):  # SLEW-PATCH
+def _slew_hand(vec, hand: str):  # SLEW-PATCH
     """
-    Cap the per-tick change of the hand command.
+    Cap the per-tick change of one hand command.
 
     Measured: at chunk boundaries the flex command snaps BACKWARD by up to
     0.499, because the new plan expects the hand less closed than it already
     is. A genuine release moves about 0.014 per tick, so the default cap of
     0.03 passes real motion at double speed and stretches a snap over ~14
-    ticks. SLEW_HAND=0 disables just this part.
+    ticks. Left and right history are tracked independently. SLEW_HAND=0
+    disables just this part.
     """
     import os as _os
     if _os.environ.get("SLEW_ENABLE", "0") != "1":
@@ -300,16 +297,16 @@ def _slew_hand(vec):  # SLEW-PATCH
         if cap <= 0:
             return vec
         cur = _np.asarray(vec, dtype=_np.float32).reshape(-1).copy()
-        prev = _slew_hand_prev[0]
+        prev = _slew_hand_prev[hand]
         if prev is None or prev.shape != cur.shape:
-            _slew_hand_prev[0] = cur.copy()
+            _slew_hand_prev[hand] = cur.copy()
             return vec
         step = _np.clip(cur - prev, -cap, cap)
         cur = prev + step
-        _slew_hand_prev[0] = cur.copy()
+        _slew_hand_prev[hand] = cur.copy()
         return cur.reshape(_np.asarray(vec).shape)
     except Exception as e:  # noqa: BLE001
-        print(f"[slew] hand limiter failed, passing through: {e}", flush=True)
+        print(f"[slew] {hand} hand limiter failed, passing through: {e}", flush=True)
         return vec
 
 
@@ -331,10 +328,21 @@ def _send_brainco_hands(left, right):
 def _override_hand_state(observation):
     try:
         left, right = _get_brainco().get_state_normalized()
-        observation["state"]["left_hand"] = np.asarray(left, dtype=np.float32)[np.newaxis, np.newaxis]
-        observation["state"]["right_hand"] = np.asarray(right, dtype=np.float32)[np.newaxis, np.newaxis]
+        left = np.asarray(left, dtype=np.float32).reshape(-1)
+        right = np.asarray(right, dtype=np.float32).reshape(-1)
+        if left.size != 6 or right.size != 6:
+            raise ValueError(
+                "BrainCo state must contain exactly 6 motors per hand, got "
+                f"left={left.size}, right={right.size}"
+            )
+        observation["state"]["left_hand"] = left.reshape(1, 1, 6)
+        observation["state"]["right_hand"] = right.reshape(1, 1, 6)
     except Exception as e:
-        print(f"[BrainCo] override failed: {e}", flush=True)
+        print(
+            f"[BrainCo] state override failed; skipping inference: {e}",
+            flush=True,
+        )
+        return None
     return observation
 
 
@@ -421,6 +429,8 @@ def prepare_observation_from_sensors(
 
     observation = prepare_observation_for_eval(robot_model, observation)
     observation = _override_hand_state(observation)
+    if observation is None:
+        return None
 
     # Projected gravity for Sonic latent embodiment
     assert "base_quat" in state_msg, "base_quat not found in state_msg"
@@ -533,7 +543,6 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
 def main(config: InferenceConfig):
     pause_loop = True
     freeze_body = False        # body frozen: skip motion_token, WBC holds pose
-    hand_override_ref = [None]  # agent puts a 6-vec here to override the RIGHT hand; None = use VLA
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
@@ -633,10 +642,6 @@ def main(config: InferenceConfig):
     cached_action_chunk = None
     action_chunk_index = 0
     last_inference_time = 0.0
-    agent = TactileAgent(hand=os.environ.get('AGENT_HAND', 'right'),
-                         enabled=os.environ.get('AGENT_ENABLE') == '1',
-                         observe=os.environ.get('AGENT_OBSERVE') == '1')  # AGENT-PATCH
-    print(f'[agent] hand={agent.hand} enabled={agent.enabled} observe={agent.observe} adjust={agent.adjust}')  # AGENT-PATCH
     probe = ChunkProbe(enabled=os.environ.get('PROBE_ENABLE') == '1')  # PROBE-PATCH
     print(f'[probe] enabled={probe.enabled}')  # PROBE-PATCH
     inference_interval = 1.0 / config.rate
@@ -688,8 +693,6 @@ def main(config: InferenceConfig):
             cached_action_chunk = None
             action_chunk_index = 0
             print("Cleared cached action chunk")
-            if agent.enabled:  # AGENT-PATCH
-                agent.reset()  # AGENT-PATCH
             if cpp_loop_running and cpp_mode == "PLANNER":
                 if send_cpp_control_command(start=True, planner=False):
                     print("Switched to POSE mode (from PLANNER mode)")
@@ -844,18 +847,6 @@ def main(config: InferenceConfig):
                     horizon = motion_token.shape[0] if motion_token.ndim == 2 else 1
                     current_idx = min(action_chunk_index, horizon - 1)
 
-                    # # AGENT-PATCH: chunk is still (T,6) — the agent looks ahead
-                    if agent.enabled:  # AGENT-PATCH
-                        agent.prompt = language_prompt_ref[0]  # AGENT-PATCH
-                        _agent_hand = left_hand_joints if agent.hand == 'left' else right_hand_joints  # AGENT-PATCH
-                        try:  # AGENT-PATCH
-                            _agent_out = agent.step(_agent_hand, current_idx)  # AGENT-PATCH
-                        except Exception as _ae:  # AGENT-PATCH
-                            print(f'[agent] step failed, disabling: {_ae}')  # AGENT-PATCH
-                            agent.enabled = False; agent.freeze_body = False  # AGENT-PATCH
-                            _agent_out = None  # AGENT-PATCH
-                        if agent.hand != 'left':  # AGENT-PATCH
-                            hand_override_ref[0] = _agent_out  # AGENT-PATCH
                     if probe.enabled:  # PROBE-PATCH
                         probe.on_step(left_hand_joints if os.environ.get('PROBE_HAND')=='left' else right_hand_joints, current_idx)  # PROBE-PATCH
 
@@ -869,27 +860,22 @@ def main(config: InferenceConfig):
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
 
-                    # --- split control (freeze_body / hand_override) ---
-                    _override = hand_override_ref[0]
-                    right_hand_out = (
-                        np.asarray(_override, dtype=right_hand_joints.dtype).reshape(right_hand_joints.shape)
-                        if _override is not None
-                        else right_hand_joints
-                    )
-                    # fingers ALWAYS sent (live hand): override if agent set one, else VLA
-                    if agent.enabled and agent.hand == 'left' and _agent_out is not None:  # AGENT-PATCH
-                        left_hand_joints = np.asarray(_agent_out, dtype=left_hand_joints.dtype).reshape(left_hand_joints.shape)  # AGENT-PATCH
-                    # # THUMBLOCK-PATCH: большой палец защёлкивается от первой же
+                    # Apply independent slew limiting to both VLA hand commands.
+                    left_hand_joints = _slew_hand(left_hand_joints, "left")
+                    right_hand_out = np.asarray(right_hand_joints).copy()
+
+                    # THUMBLOCK-PATCH: большой палец защёлкивается от первой же
                     # команды на сгиб (13 авг) — не даём её вообще.
                     # Снять после ремонта: --revert
-                    for _bi in [0]:  # THUMBLOCK-PATCH
-                        right_hand_out[_bi] = 0.0  # THUMBLOCK-PATCH
-                    left_hand_joints = _slew_hand(left_hand_joints)  # SLEW-PATCH
+                    right_hand_out[0] = 0.0  # THUMBLOCK-PATCH
+                    right_hand_out = _slew_hand(right_hand_out, "right")
+                    right_hand_out[0] = 0.0  # Keep the thumb hard-blocked after slew.
+
                     _send_brainco_hands(left_hand_joints, right_hand_out)
                     if probe.enabled:  # PROBE-PATCH
                         probe.on_sent(left_hand_joints if os.environ.get('PROBE_HAND')=='left' else right_hand_out, motion_token)  # PROBE-PATCH
                     # body/motion_token skipped when frozen - WBC holds the last pose itself
-                    if not (freeze_body or (agent.enabled and agent.freeze_body)):  # AGENT-PATCH
+                    if not freeze_body:
                         motion_token = _slew_limit(motion_token)  # SLEW-PATCH
                         zmq_message = pack_latent_action_message(
                             motion_token,
