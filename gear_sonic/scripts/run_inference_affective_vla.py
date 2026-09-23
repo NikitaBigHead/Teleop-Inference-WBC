@@ -122,6 +122,16 @@ class InferenceConfig:
     prompt: str = "demo"
     """The language prompt for the VLA policy."""
 
+    # BrainCo contact detection
+    brainco_contact_position_error_threshold: float = 0.05
+    """Minimum command/state position lag used to detect contact."""
+
+    brainco_contact_count: int = 3
+    """Consecutive contact detections required to block finger closing."""
+
+    brainco_contact_hold_seconds: float = 1.0
+    """Seconds to block further finger closing after contact."""
+
     # Debug
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
@@ -213,18 +223,52 @@ def get_action_field(action_dict: dict, key: str):
 
 # --- BrainCo hand state override (6 DOF, как при сборе данных) ---
 _BRAINCO_CTRL = None
+_BRAINCO_STATE_LOCK = threading.Lock()
+_BRAINCO_STATES = {"left": None, "right": None}
+_BRAINCO_STATE_SUBSCRIBERS = []
+
+_BRAINCO_NUM_MOTORS = 6
+_BRAINCO_MOTOR_NAMES = ("thumb", "thumb_aux", "index", "middle", "ring", "pinky")
+
+_brainco_last_command = {"left": None, "right": None}
+_brainco_contact_blocked_until = {
+    "left": np.zeros(_BRAINCO_NUM_MOTORS, dtype=np.float64),
+    "right": np.zeros(_BRAINCO_NUM_MOTORS, dtype=np.float64),
+}
+_brainco_contact_counter = {
+    "left": np.zeros(_BRAINCO_NUM_MOTORS, dtype=np.int32),
+    "right": np.zeros(_BRAINCO_NUM_MOTORS, dtype=np.int32),
+}
+
+
+def _set_brainco_state(hand: str, msg) -> None:
+    with _BRAINCO_STATE_LOCK:
+        _BRAINCO_STATES[hand] = msg
 
 def _get_brainco():
-    global _BRAINCO_CTRL
+    global _BRAINCO_CTRL, _BRAINCO_STATE_SUBSCRIBERS
     if _BRAINCO_CTRL is None:
         import sys as _sys
         if "/home/unitree/gr00t-g1-bridge" not in _sys.path:
             _sys.path.insert(0, "/home/unitree/gr00t-g1-bridge")
-        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
         try:
             ChannelFactoryInitialize(0, "wlxfc23cd997021")
         except Exception as e:
             print(f"[BrainCo] ChannelFactoryInitialize: {e}", flush=True)
+
+        for hand, topic in (
+            ("left", "rt/brainco/left/state"),
+            ("right", "rt/brainco/right/state"),
+        ):
+            subscriber = ChannelSubscriber(topic, MotorStates_)
+            subscriber.Init(
+                lambda msg, hand=hand: _set_brainco_state(hand, msg),
+                10,
+            )
+            _BRAINCO_STATE_SUBSCRIBERS.append(subscriber)
+
         from brainco_hand import BraincoHandController
         _BRAINCO_CTRL = BraincoHandController()
         _BRAINCO_CTRL.wait_ready(10.0)
@@ -310,19 +354,123 @@ def _slew_hand(vec, hand: str):  # SLEW-PATCH
         return vec
 
 
-def _send_brainco_hands(left, right):
-    """Шлём 6-DOF команды кисти напрямую в BrainCo DDS (как при сборе данных)."""
+def _filter_brainco_contacts(
+    hand: str,
+    target,
+    position_error_threshold: float,
+    contact_count: int,
+    hold_seconds: float,
+) -> np.ndarray:
+    """Block further closing after contact while always allowing opening."""
+    target = np.clip(
+        np.asarray(target, dtype=np.float32).reshape(_BRAINCO_NUM_MOTORS),
+        0.0,
+        1.0,
+    )
+    previous = _brainco_last_command[hand]
+    if previous is None:
+        _brainco_last_command[hand] = target.copy()
+        return target
+
+    with _BRAINCO_STATE_LOCK:
+        state = _BRAINCO_STATES[hand]
+        if state is not None and len(state.states) >= _BRAINCO_NUM_MOTORS:
+            state_q = np.asarray(
+                [state.states[idx].q for idx in range(_BRAINCO_NUM_MOTORS)],
+                dtype=np.float32,
+            )
+        else:
+            state_q = None
+
+    output = previous.copy()
+    blocked_until = _brainco_contact_blocked_until[hand]
+    counters = _brainco_contact_counter[hand]
+    now = time.monotonic()
+
+    for idx in range(_BRAINCO_NUM_MOTORS):
+        target_q = float(target[idx])
+        previous_q = float(previous[idx])
+
+        # Smaller normalized q opens the finger. Opening always passes through
+        # and rearms contact detection for the next closing motion.
+        if target_q < previous_q:
+            if now < blocked_until[idx]:
+                print(
+                    f"[BrainCo] RELEASE {hand} {_BRAINCO_MOTOR_NAMES[idx]}: "
+                    f"q_cmd={target_q:.3f}",
+                    flush=True,
+                )
+            output[idx] = target_q
+            blocked_until[idx] = 0.0
+            counters[idx] = 0
+            continue
+
+        if now < blocked_until[idx]:
+            # Ignore equal or larger VLA targets until the contact timer expires.
+            output[idx] = previous_q
+            continue
+
+        if blocked_until[idx] > 0.0:
+            blocked_until[idx] = 0.0
+            counters[idx] = 0
+            print(
+                f"[BrainCo] CONTACT TIMER EXPIRED {hand} "
+                f"{_BRAINCO_MOTOR_NAMES[idx]}",
+                flush=True,
+            )
+
+        if target_q > previous_q and state_q is not None:
+            contact = previous_q - float(state_q[idx]) > position_error_threshold
+            counters[idx] = counters[idx] + 1 if contact else 0
+            if counters[idx] >= contact_count:
+                output[idx] = float(np.clip(state_q[idx], 0.0, 1.0))
+                blocked_until[idx] = now + hold_seconds
+                counters[idx] = 0
+                print(
+                    f"[BrainCo] CONTACT {hand} {_BRAINCO_MOTOR_NAMES[idx]}: "
+                    f"q={output[idx]:.3f}, block={hold_seconds:.2f}s",
+                    flush=True,
+                )
+                continue
+        else:
+            counters[idx] = 0
+
+        output[idx] = target_q
+
+    _brainco_last_command[hand] = output.copy()
+    return output
+
+
+def _send_brainco_hands(
+    left,
+    right,
+    position_error_threshold: float,
+    contact_count: int,
+    hold_seconds: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filter and send 6-DOF commands directly to BrainCo DDS."""
     import os as _os
     enable = _os.environ.get("HAND_ENABLE", "0") == "1"
+    l = np.clip(np.asarray(left, dtype=np.float32).reshape(-1)[:6], 0.0, 1.0)
+    r = np.clip(np.asarray(right, dtype=np.float32).reshape(-1)[:6], 0.0, 1.0)
     try:
         ctrl = _get_brainco()
-        l = np.clip(np.asarray(left, dtype=np.float32).reshape(-1)[:6], 0.0, 1.0)
-        r = np.clip(np.asarray(right, dtype=np.float32).reshape(-1)[:6], 0.0, 1.0)
+        if enable:
+            l = _filter_brainco_contacts(
+                "left", l, position_error_threshold, contact_count, hold_seconds
+            )
+            r = _filter_brainco_contacts(
+                "right", r, position_error_threshold, contact_count, hold_seconds
+            )
+            # Keep slew history aligned with the command that was actually sent.
+            _slew_hand_prev["left"] = l.copy()
+            _slew_hand_prev["right"] = r.copy()
         ctrl.send_targets_normalized(l, r, dry_run=not enable)
         if not enable:
             print(f"[BrainCo] DRY-RUN right={r.round(3)}", flush=True)
     except Exception as e:
         print(f"[BrainCo] send failed: {e}", flush=True)
+    return l, r
 
 
 def _override_hand_state(observation):
@@ -541,6 +689,15 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
 
 
 def main(config: InferenceConfig):
+    if config.brainco_contact_position_error_threshold < 0:
+        raise ValueError(
+            "brainco_contact_position_error_threshold must be non-negative"
+        )
+    if config.brainco_contact_count <= 0:
+        raise ValueError("brainco_contact_count must be positive")
+    if config.brainco_contact_hold_seconds < 0:
+        raise ValueError("brainco_contact_hold_seconds must be non-negative")
+
     pause_loop = True
     freeze_body = False        # body frozen: skip motion_token, WBC holds pose
 
@@ -871,7 +1028,15 @@ def main(config: InferenceConfig):
                     right_hand_out = _slew_hand(right_hand_out, "right")
                     right_hand_out[0] = 0.0  # Keep the thumb hard-blocked after slew.
 
-                    _send_brainco_hands(left_hand_joints, right_hand_out)
+                    left_hand_joints, right_hand_out = _send_brainco_hands(
+                        left_hand_joints,
+                        right_hand_out,
+                        position_error_threshold=(
+                            config.brainco_contact_position_error_threshold
+                        ),
+                        contact_count=config.brainco_contact_count,
+                        hold_seconds=config.brainco_contact_hold_seconds,
+                    )
                     if probe.enabled:  # PROBE-PATCH
                         probe.on_sent(left_hand_joints if os.environ.get('PROBE_HAND')=='left' else right_hand_out, motion_token)  # PROBE-PATCH
                     # body/motion_token skipped when frozen - WBC holds the last pose itself
