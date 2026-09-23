@@ -25,7 +25,7 @@ socat TCP-LISTEN:5555,fork,reuseaddr TCP:172.17.0.2:5555
 ```bash
 # 1. камера
 cd ~/GR00T-WholeBodyControl && source .venv_camera/bin/activate
-cd /home/unitree/teleop-ws/Teleop-Data-Collection
+cd /home/unitree/teleop-ws/Teleop-Inference-WBC
 python -m gear_sonic.camera.composed_camera \
   --ego-view-camera realsense \
   --ego-view-device-id 243422071979 \
@@ -103,7 +103,7 @@ python3 ~/keypress.py
 ### База (VLA одна)
 
 ```bash
-cd ~/GR00T-WholeBodyControl && source .venv_data_collection/bin/activate && AGENT_HAND=left AGENT_ENABLE=0 SLEW_ENABLE=1 PROBE_HAND=left PROBE_ENABLE=1 HAND_ENABLE=1 PYTHONPATH=/home/unitree/unitree_sdk2_python python gear_sonic/scripts/run_inference_affective_vla.py --host 100.64.0.21 --port 5555 --camera-host localhost --camera-port 5555 --state-zmq-host localhost --state-zmq-port 5557 --action-zmq-host localhost --action-zmq-port 5556 --embodiment-tag NEW_EMBODIMENT --prompt "hug" 2>&1 | tee ~/bridge_base_$(date +%Y%m%d_%H%M).log
+cd ~/GR00T-WholeBodyControl && source .venv_data_collection/bin/activate && AGENT_HAND=left AGENT_ENABLE=0 SLEW_ENABLE=1 PROBE_HAND=left PROBE_ENABLE=1 HAND_ENABLE=1 PYTHONPATH=/home/unitree/unitree_sdk2_python python /home/unitree/teleop-ws/Teleop-Inference-WBC/gear_sonic/scripts/run_inference_affective_vla.py --host 100.64.0.21 --port 5555 --camera-host localhost --camera-port 5555 --state-zmq-host localhost --state-zmq-port 5557 --action-zmq-host localhost --action-zmq-port 5556 --embodiment-tag NEW_EMBODIMENT --prompt "hug" 2>&1 | tee ~/bridge_base_$(date +%Y%m%d_%H%M).log
 ```
 
 **Клавиши:** `k` старт → `i` начальная поза (обязательно) → `p` снять паузу (тумблер) → `g` заморозка тела.

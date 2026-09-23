@@ -19,7 +19,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
   k  -> start / stop the C++ control loop
   i  -> send initial pose and switch to POSE mode
-  t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
+  pr <text> -> change prompt at runtime (received via ZMQ)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
   c  -> start recording (handled by data exporter if running)
@@ -643,7 +643,10 @@ def main(config: InferenceConfig):
 
     zmq_frame_counter = 0
 
+    # ``pr <text>`` is the command format emitted by the ZMQ controller.
+    # Keep ``prompt:<text>`` for compatibility with the previous publisher.
     PROMPT_MSG_PREFIX = "prompt:"
+    PROMPT_COMMAND_PREFIX = "pr "
 
     def check_keyboard_input():
         nonlocal pause_loop, freeze_body, cpp_loop_running, cpp_mode
@@ -655,8 +658,14 @@ def main(config: InferenceConfig):
         if key is None:
             return
 
-        if key.startswith(PROMPT_MSG_PREFIX):
-            new_prompt = key[len(PROMPT_MSG_PREFIX):]
+        if key.startswith(PROMPT_COMMAND_PREFIX):
+            new_prompt = key[len(PROMPT_COMMAND_PREFIX):].strip()
+        elif key.startswith(PROMPT_MSG_PREFIX):
+            new_prompt = key[len(PROMPT_MSG_PREFIX):].strip()
+        else:
+            new_prompt = None
+
+        if new_prompt is not None:
             if new_prompt:
                 old_prompt = language_prompt_ref[0]
                 language_prompt_ref[0] = new_prompt
