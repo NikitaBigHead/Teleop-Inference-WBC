@@ -136,6 +136,10 @@
 // Error monitor
 #include "../include/error_monitor.hpp"
 
+// Runtime arm impedance (Kp/Kd) profiles
+#include "../include/arm_compliance.hpp"
+#include "../include/arm_compliance_subscriber.hpp"
+
 #include "audio_thread/audio_thread.hpp"
 
 // DDS
@@ -338,6 +342,11 @@ class G1Deploy {
     
     // Output interfaces (supports multiple simultaneous outputs)
     std::vector<std::unique_ptr<OutputInterface>> output_interfaces_;
+
+    // Runtime arm impedance layer (null unless --arm-compliance is given)
+    std::unique_ptr<arm_compliance::Controller> arm_compliance_;
+    bool arm_ref_is_planner_ = false;  ///< Reference motion is the planner's (set each control tick)
+    std::unique_ptr<arm_compliance::Subscriber> arm_compliance_sub_;
 
     // =========================================================================
     // Core ML components (encoder + policy) and interfaces
@@ -1107,7 +1116,11 @@ class G1Deploy {
 
       // 1. Input interface providing VR 3-point (ZMQ, ROS2) -> use buffer
       // 2. Otherwise -> compute from motion body positions with offsets
-      bool use_buffered_vr3 = has_vr_3point_data_;
+      // Arm-compliance ESTOP (handoff): blend the operator's targets toward the
+      // reference's (weight w: 0 = operator, 1 = reference) so the policy itself
+      // brings the arms down.
+      const float hand_w = arm_compliance_ ? arm_compliance_->HandTargetBlend() : 0.0f;
+      bool use_buffered_vr3 = has_vr_3point_data_ && hand_w <= 0.0f;
       
       if (use_buffered_vr3) {
         // Use VR 3-point data from input interface directly
@@ -1115,6 +1128,8 @@ class G1Deploy {
         std::copy(vr_3point_position_buffer_.begin(), vr_3point_position_buffer_.end(), target_buffer.begin() + offset);
         return true;
       }
+      const bool blend_vr3 = has_vr_3point_data_ && hand_w < 1.0f;
+      const std::array<double, 9> operator_vr3_position = vr_3point_position_buffer_;
       
       // No external VR 3-point data - compute from motion's body positions
       // Update VR3Point indices for current motion (different motions have different BodyPartIndexes)
@@ -1186,6 +1201,12 @@ class G1Deploy {
         vr_3point_position[i * 3 + 2] = normalized_pos[2];
       }
       
+      if (blend_vr3) {
+        for (int k = 0; k < 9; ++k) {
+          vr_3point_position[k] = (1.0 - hand_w) * operator_vr3_position[k] + hand_w * vr_3point_position[k];
+        }
+      }
+
       std::copy(
         vr_3point_position.begin(),
         vr_3point_position.end(),
@@ -1203,12 +1224,15 @@ class G1Deploy {
         return false; 
       }
       
-      bool use_buffered_vr3 = has_vr_3point_data_;
+      const float hand_w = arm_compliance_ ? arm_compliance_->HandTargetBlend() : 0.0f;
+      bool use_buffered_vr3 = has_vr_3point_data_ && hand_w <= 0.0f;
 
       if (use_buffered_vr3) {
         std::copy(vr_3point_orientation_buffer_.begin(), vr_3point_orientation_buffer_.end(), target_buffer.begin() + offset);
         return true;
       }
+      const bool blend_vr3 = has_vr_3point_data_ && hand_w < 1.0f;
+      const std::array<double, 12> operator_vr3_orientation = vr_3point_orientation_buffer_;
       
       // No external VR 3-point data - compute from motion's body positions
       // Update VR3Point indices for current motion (different motions have different BodyPartIndexes)
@@ -1252,6 +1276,25 @@ class G1Deploy {
         vr_3point_orientation[i * 4 + 3] = normalized_quat[3]; // z
       }
       
+      if (blend_vr3) {
+        // Normalized lerp per quaternion (w, x, y, z), shortest path
+        for (int i = 0; i < 3; ++i) {
+          double dot = 0.0;
+          for (int k = 0; k < 4; ++k) dot += operator_vr3_orientation[i * 4 + k] * vr_3point_orientation[i * 4 + k];
+          const double sign = dot < 0.0 ? -1.0 : 1.0;
+          double norm = 0.0;
+          for (int k = 0; k < 4; ++k) {
+            double& q = vr_3point_orientation[i * 4 + k];
+            q = (1.0 - hand_w) * operator_vr3_orientation[i * 4 + k] + hand_w * sign * q;
+            norm += q * q;
+          }
+          norm = std::sqrt(norm);
+          if (norm > 1e-9) {
+            for (int k = 0; k < 4; ++k) vr_3point_orientation[i * 4 + k] /= norm;
+          }
+        }
+      }
+
       std::copy(
         vr_3point_orientation.begin(),
         vr_3point_orientation.end(),
@@ -2159,7 +2202,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      arm_compliance::Config arm_compliance_config = arm_compliance::Config{})
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2576,6 +2620,24 @@ class G1Deploy {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
       }
 
+      // Runtime arm impedance layer (must exist before the control thread starts)
+      if (arm_compliance_config.enabled) {
+        // ESTOP retract target: the policy's own default arm pose
+        for (int j = 0; j < arm_compliance::kNumArmMotors; ++j) {
+          arm_compliance_config.safe_pose[j] =
+              static_cast<float>(default_angles[arm_compliance::kFirstArmMotor + j]);
+        }
+        arm_compliance_ = std::make_unique<arm_compliance::Controller>(arm_compliance_config);
+        arm_compliance_sub_ = std::make_unique<arm_compliance::Subscriber>(*arm_compliance_);
+        arm_compliance_sub_->Start();
+        std::cout << "\n┌─────────────────────────────────────────────────────────────────────────────┐" << std::endl;
+        std::cout << "│  Arm compliance layer: ENABLED (arm motors 15-28)                           │" << std::endl;
+        std::cout << "└─────────────────────────────────────────────────────────────────────────────┘" << std::endl;
+        std::cout << "  initial profile: " << arm_compliance_config.initial_profile
+                  << ", commands from tcp://" << arm_compliance_config.host << ":" << arm_compliance_config.port
+                  << " topic '" << arm_compliance_config.topic << "'\n" << std::endl;
+      }
+
       // create threads
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
@@ -2697,6 +2759,9 @@ class G1Deploy {
           planner_thread_ptr_->Wait();
           planner_thread_ptr_.reset();
         }
+      }
+      if (arm_compliance_sub_) {
+        arm_compliance_sub_->Stop();
       }
       CreateDampingCommand();
       LowCommandWriter();
@@ -3127,6 +3192,23 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      // Arm compliance: rescale arm Kp/Kd per profile; during ESTOP it also owns the
+      // arm position targets (controlled stop). No-op if disabled.
+      if (arm_compliance_) {
+        arm_compliance::ArmArray arm_q_meas{};
+        const std::shared_ptr<const LowState_> ls = low_state_buffer_.GetDataWithTime().data;
+        for (int j = 0; j < arm_compliance::kNumArmMotors; ++j) {
+          const int m = arm_compliance::kFirstArmMotor + j;
+          arm_q_meas[j] = ls ? ls->motor_state()[m].q() : motor_command_tmp.q_target.at(m);
+        }
+        // The policy can bring the arms down itself when its reference is the planner
+        // (planner walking, VR_3PT teleop): handing its hand targets to the planner's
+        // idle pose lowers the arms. Reference clips and full-body POSE streaming use
+        // the retract override instead.
+        const bool policy_can_retract = arm_ref_is_planner_;
+        arm_compliance_->Apply(motor_command_tmp.q_target, motor_command_tmp.kp, motor_command_tmp.kd,
+                               arm_q_meas, control_dt_, policy_can_retract);
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -3911,6 +3993,7 @@ class G1Deploy {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
             current_frame_copy = current_frame_;
             current_motion_copy = current_motion_;
+            arm_ref_is_planner_ = planner_ && current_motion_ && current_motion_ == planner_motion_;
             current_encoder_mode_copy = current_motion_copy->GetEncodeMode();
             current_play_copy = operator_state.play;
 
@@ -4137,6 +4220,26 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --arm-compliance: enable runtime arm Kp/Kd profiles (arm motors 15-28; default: OFF)" << std::endl;
+    std::cout << "  --compliance-host <host>: host of the compliance command publisher (default: localhost)" << std::endl;
+    std::cout << "  --compliance-port <port>: port of the compliance command publisher (default: 5565)" << std::endl;
+    std::cout << "  --compliance-topic <topic>: ZMQ topic for compliance commands (default: compliance)" << std::endl;
+    std::cout << "  --compliance-profiles <file.json>: extra arm profiles (see ARM_COMPLIANCE.md)" << std::endl;
+    std::cout << "  --compliance-profile <NAME>: initial arm profile (default: RIGID = SONIC default gains)" << std::endl;
+    std::cout << "  --compliance-soften <s>: ramp time when a joint gets softer (default: 0.3)" << std::endl;
+    std::cout << "  --compliance-stiffen <s>: ramp time when a joint gets stiffer (default: 1.0)" << std::endl;
+    std::cout << "  --compliance-slew <s>: set both ramp times at once" << std::endl;
+    std::cout << "  --compliance-estop-mode <auto|retract|limp>: auto = policy brings the arms down (hand-target handoff) when possible,\n"
+              << "                                   else retract override; retract = always override; limp = gains only (default: auto)" << std::endl;
+    std::cout << "  --compliance-handoff <s>: hand-target blend time in auto ESTOP (default: 1.5)" << std::endl;
+    std::cout << "  --compliance-retract-speed <deg/s>: peak joint speed of the retract (default: 45)" << std::endl;
+    std::cout << "  --compliance-retract-kp <scale>: arm stiffness while retracting, x default Kp (default: 0.6)" << std::endl;
+    std::cout << "  --compliance-retract-max <s>: longest allowed retract (default: 3.0)" << std::endl;
+    std::cout << "  --compliance-estop-kp <value>: arm Kp during ESTOP, absolute (default: 1.5; default arm Kp ~14.3)" << std::endl;
+    std::cout << "  --compliance-estop-kd <value>: arm Kd during ESTOP, absolute (default: 0.9; default arm Kd ~0.9)" << std::endl;
+    std::cout << "  --compliance-estop-ramp <s>: ramp to the ESTOP gains (default: 1.0)" << std::endl;
+    std::cout << "  --compliance-estop-release <s>: blend back to the policy after release (default: 1.0)" << std::endl;
+    std::cout << "  --compliance-watchdog <s>: warn and hold gains if no command for this long (default: 1.0, 0 = off)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4180,6 +4283,15 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  arm_compliance::Config arm_compliance_config;  // disabled unless --arm-compliance
+  // Helper: fetch the value after a flag or exit with an error
+  auto require_value = [&](int& i, const char* flag) -> std::string {
+    if (i + 1 >= argc) {
+      std::cerr << "Error: " << flag << " requires a value argument" << std::endl;
+      exit(1);
+    }
+    return std::string(argv[++i]);
+  };
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4409,6 +4521,76 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--arm-compliance") {
+      arm_compliance_config.enabled = true;
+    } else if (std::string(argv[i]) == "--compliance-host") {
+      arm_compliance_config.host = require_value(i, "--compliance-host");
+    } else if (std::string(argv[i]) == "--compliance-topic") {
+      arm_compliance_config.topic = require_value(i, "--compliance-topic");
+    } else if (std::string(argv[i]) == "--compliance-profile") {
+      arm_compliance_config.initial_profile = require_value(i, "--compliance-profile");
+    } else if (std::string(argv[i]) == "--compliance-profiles") {
+      arm_compliance_config.profiles_file = require_value(i, "--compliance-profiles");
+    } else if (std::string(argv[i]) == "--compliance-estop-mode") {
+      const std::string mode = require_value(i, "--compliance-estop-mode");
+      if (mode == "auto") {
+        arm_compliance_config.estop_mode = arm_compliance::EstopMode::kAuto;
+      } else if (mode == "retract") {
+        arm_compliance_config.estop_mode = arm_compliance::EstopMode::kRetract;
+      } else if (mode == "limp") {
+        arm_compliance_config.estop_mode = arm_compliance::EstopMode::kLimp;
+      } else {
+        std::cerr << "Error: --compliance-estop-mode must be 'auto', 'retract' or 'limp'" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--compliance-port" ||
+               std::string(argv[i]) == "--compliance-slew" ||
+               std::string(argv[i]) == "--compliance-soften" ||
+               std::string(argv[i]) == "--compliance-stiffen" ||
+               std::string(argv[i]) == "--compliance-estop-kd" ||
+               std::string(argv[i]) == "--compliance-estop-kp" ||
+               std::string(argv[i]) == "--compliance-estop-ramp" ||
+               std::string(argv[i]) == "--compliance-estop-release" ||
+               std::string(argv[i]) == "--compliance-retract-speed" ||
+               std::string(argv[i]) == "--compliance-handoff" ||
+               std::string(argv[i]) == "--compliance-retract-kp" ||
+               std::string(argv[i]) == "--compliance-retract-max" ||
+               std::string(argv[i]) == "--compliance-watchdog") {
+      const std::string flag = argv[i];
+      const std::string value = require_value(i, flag.c_str());
+      try {
+        if (flag == "--compliance-port") {
+          arm_compliance_config.port = std::stoi(value);
+        } else if (flag == "--compliance-slew") {
+          arm_compliance_config.soften_s = std::stod(value);
+          arm_compliance_config.stiffen_s = arm_compliance_config.soften_s;
+        } else if (flag == "--compliance-soften") {
+          arm_compliance_config.soften_s = std::stod(value);
+        } else if (flag == "--compliance-stiffen") {
+          arm_compliance_config.stiffen_s = std::stod(value);
+        } else if (flag == "--compliance-estop-kd") {
+          arm_compliance_config.estop_kd = std::stof(value);
+        } else if (flag == "--compliance-estop-kp") {
+          arm_compliance_config.estop_kp = std::stof(value);
+        } else if (flag == "--compliance-estop-ramp") {
+          arm_compliance_config.estop_ramp_s = std::stod(value);
+        } else if (flag == "--compliance-estop-release") {
+          arm_compliance_config.estop_release_s = std::stod(value);
+        } else if (flag == "--compliance-retract-speed") {
+          arm_compliance_config.retract_speed = std::stod(value) * 3.14159265358979323846 / 180.0;  // deg/s -> rad/s
+        } else if (flag == "--compliance-handoff") {
+          arm_compliance_config.handoff_s = std::stod(value);
+        } else if (flag == "--compliance-retract-kp") {
+          arm_compliance_config.retract_kp_scale = std::stof(value);
+        } else if (flag == "--compliance-retract-max") {
+          arm_compliance_config.retract_max_s = std::stod(value);
+        } else {
+          arm_compliance_config.watchdog_s = std::stod(value);
+        }
+      } catch (...) {
+        std::cerr << "Error: invalid value for " << flag << ": " << value << std::endl;
+        exit(1);
+      }
     }
   }
 
@@ -4441,7 +4623,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    arm_compliance_config
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
