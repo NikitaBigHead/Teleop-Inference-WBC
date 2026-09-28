@@ -1,5 +1,28 @@
 # Interaction Phase Annotation
 
+## Reviewing discarded episodes
+
+`annotate_discarded.py` opens `extended-sep-24-with-none` by default. It shows each
+episode's video, lets you switch between its three cameras, and saves selected episode
+IDs to `meta/info.json` under `discarded_episode_indices`.
+
+```bash
+python annotate_discarded.py
+python annotate_discarded.py --episode 42
+python annotate_discarded.py /path/to/another/dataset
+```
+
+Install `requirements-annotator.txt` first if PySide6 is unavailable. Press **Space**
+or click the main button to mark an episode as discarded; repeat to undo. Press
+**Enter** for the next episode, **Alt+Left/Right** to move in either direction, and
+**R** or **K** to play or pause. Changes save immediately. On the first change, the
+tool creates `meta/info.json.bak` with the original metadata.
+
+The reviewer only changes `discarded_episode_indices`. It does not remove episode
+files. To remove marked episodes later, use `remove_discarded.py` separately.
+
+## Phase annotation
+
 `annotate_phases.py` opens a local window for video annotation. It saves phase
 timestamps to `meta/interaction_metadata.jsonl` in the selected dataset. The interface
 has a simple dark design with a video player, four phase fields, a timeline with orange

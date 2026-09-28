@@ -221,3 +221,4 @@ sample_data/
 sonic_release/
 extend_scripts/analysis
 chpts_rldx/
+tmp/

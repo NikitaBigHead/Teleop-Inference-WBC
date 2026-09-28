@@ -46,7 +46,9 @@ python -m gear_sonic.camera.composed_camera \
 ##  2. Brainco  — РОВНО ОДИН экземпляр
 
 ```bash
-/home/unitree/teleop-ws/Teleop-Inference-WBC/gear_sonic/scripts/start_brainco_and_check.sh   --interface wlxfc23cd997021
+cd /home/unitree/teleop-ws/Teleop-Inference-WBC/gear_sonic/scripts 
+chmod 777 ./start_brainco_and_check.sh 
+./start_brainco_and_check.sh   --interface wlxfc23cd997021
 ```
 
 # 3. WBC — ждать «Init done»
@@ -56,7 +58,7 @@ python -m gear_sonic.camera.composed_camera \
 ```bash
 export TensorRT_ROOT="$HOME/TensorRT"
 cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && source scripts/setup_env.sh
-./deploy.sh --cp policy/sonic_v1_1/model --obs-config policy/sonic_v1_1/observation_config.yaml --input-type zmq_manager real
+./deploy.sh --input-type zmq_manager real
 ```
 
 ## Impedance profiles for deploy
