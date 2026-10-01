@@ -7,6 +7,7 @@ All communication uses ZMQ:
   2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints)
   3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
   4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
+  5. Compliance   -> optional ZMQ PUB of runtime Kp/Kd profiles to C++ deploy
 
 Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
 running PolicyServer. The robot camera transport names are mapped to the
@@ -56,6 +57,7 @@ from gear_sonic.utils.inference.human_intent import (
     INTENT_TO_PROMPT,
     IntentController,
 )
+from gear_sonic.utils.inference.intent_compliance import ComplianceProfilePublisher
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -142,6 +144,15 @@ class InferenceConfig:
 
     intent_unknown_grace: float = 0.3
     """How long a continuous unknown prediction is tolerated before safe hold."""
+
+    intent_compliance: bool = False
+    """Switch C++ arm-compliance profiles when a new VLA prompt starts executing."""
+
+    compliance_port: int = 5565
+    """Port bound by the compliance command publisher."""
+
+    compliance_rate: float = 10.0
+    """Compliance profile heartbeat rate in Hz."""
 
     # BrainCo contact detection
     brainco_contact_position_error_threshold: float = 0.05
@@ -753,6 +764,10 @@ def main(config: InferenceConfig):
         raise ValueError("brainco_contact_count must be positive")
     if config.brainco_contact_hold_seconds < 0:
         raise ValueError("brainco_contact_hold_seconds must be non-negative")
+    if not 1 <= config.compliance_port <= 65535:
+        raise ValueError("compliance_port must be between 1 and 65535")
+    if config.compliance_rate <= 0:
+        raise ValueError("compliance_rate must be positive")
 
     intent_controller = IntentController(
         mode=config.intent_mode,
@@ -802,6 +817,23 @@ def main(config: InferenceConfig):
         f"ZMQ action socket bound to tcp://{config.action_zmq_host}:{config.action_zmq_port}"
     )
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
+
+    compliance_socket = None
+    compliance_publisher = None
+    if config.intent_compliance:
+        compliance_socket = zmq_context.socket(zmq.PUB)
+        compliance_socket.setsockopt(zmq.LINGER, 0)
+        compliance_socket.setsockopt(zmq.SNDHWM, 1)
+        compliance_socket.bind(f"tcp://*:{config.compliance_port}")
+        compliance_publisher = ComplianceProfilePublisher(
+            compliance_socket, rate_hz=config.compliance_rate
+        )
+        compliance_publisher.set_prompt(intent_controller.prompt)
+        print_green(
+            f"Intent compliance PUB bound to tcp://*:{config.compliance_port}; "
+            f"initial profile={compliance_publisher.profile}; "
+            f"heartbeat={config.compliance_rate:.1f} Hz"
+        )
 
     keyboard_listener = ZMQKeyboardSubscriber(
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
@@ -905,6 +937,12 @@ def main(config: InferenceConfig):
         last_inference_time = 0.0
         drain(inference_queue)
         drain(result_queue)
+        if compliance_publisher is not None and intent_controller.inference_enabled:
+            if compliance_publisher.set_prompt(intent_controller.prompt):
+                print_green(
+                    f"Arm compliance -> {compliance_publisher.profile} "
+                    f'(preparing prompt "{intent_controller.prompt}")'
+                )
         print_green(
             f'Intent epoch {intent_controller.epoch}: prompt "{old_prompt}" -> '
             f'"{intent_controller.prompt}"; mode={intent_controller.mode}; '
@@ -1033,6 +1071,8 @@ def main(config: InferenceConfig):
         while True:
             t_start = time.monotonic()
             check_keyboard_input()
+            if compliance_publisher is not None:
+                compliance_publisher.tick(t_start)
 
             intent_event = intent_subscriber.read_latest()
             intent_now = time.monotonic()
@@ -1233,6 +1273,8 @@ def main(config: InferenceConfig):
     finally:
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
+        if compliance_socket is not None:
+            compliance_socket.close()
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()
