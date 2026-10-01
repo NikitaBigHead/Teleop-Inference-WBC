@@ -58,6 +58,7 @@
 #include "zmq_packed_message_subscriber.hpp"
 #include "../localmotion_kplanner.hpp"  // For LocomotionMode enum
 #include "../math_utils.hpp"  // For normalize_vector
+#include "../safe_stop.hpp"   // Safe stop (k / u keys, safe_stop / safe_release command fields)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -142,6 +143,31 @@ class ZMQManager : public InputInterface {
       );
       
       planner_subscriber_->Start();
+
+      // Safe-stop state for the BrainCo hand senders (they open the hands while stopped).
+      safe_stop_status_ = std::make_unique<safe_stop::StatusPublisher>(safe_stop::Settings().status_port);
+
+      // Safety topic from the voice node (voice_safe_stop.py), own port on the same host.
+      if (safe_stop::Settings().voice_port > 0) {
+        safety_subscriber_ = std::make_unique<ZMQPackedMessageSubscriber>(
+          zmq_host_, safe_stop::Settings().voice_port, "safety",
+          /*timeout_ms=*/100, zmq_verbose_, /*use_conflate=*/false, /*rcv_hwm=*/10);
+        safety_subscriber_->SetOnDecodedMessage(
+          [](const std::string&, const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
+             const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
+            for (size_t i = 0; i < hdr.fields.size() && i < bufs.size(); ++i) {
+              if (bufs[i].size < 1) continue;
+              uint8_t v = 0;
+              std::memcpy(&v, bufs[i].data, 1);
+              if (v == 0) continue;
+              if (hdr.fields[i].name == "safe_stop") safe_stop::Request("voice");
+              else if (hdr.fields[i].name == "safe_release") safe_stop::Release("voice");
+            }
+          });
+        safety_subscriber_->Start();
+        std::cout << "  - Safety topic: 'safety' on " << zmq_host_ << ":" << safe_stop::Settings().voice_port
+                  << " (voice safe stop)" << std::endl;
+      }
       
       std::cout << "[ZMQManager] Initialized (default: PLANNER mode)" << std::endl;
       std::cout << "  - Host: " << zmq_host_ << ":" << zmq_port_ << std::endl;
@@ -153,6 +179,7 @@ class ZMQManager : public InputInterface {
     
     ~ZMQManager() {
       if (command_subscriber_) command_subscriber_->Stop();
+      if (safety_subscriber_) safety_subscriber_->Stop();
       if (planner_subscriber_) planner_subscriber_->Stop();
     }
 
@@ -173,6 +200,17 @@ class ZMQManager : public InputInterface {
             emergency_stop_ = true;
             is_manager_key = true;
             std::cout << "[ZMQManager] EMERGENCY STOP (O/o)" << std::endl;
+            break;
+          // Safe stop: stop teleop / VLA, soft ready stand (see safe_stop.hpp)
+          case 'k':
+          case 'K':
+            safe_stop::Request("key k");
+            is_manager_key = true;
+            break;
+          case 'u':
+          case 'U':
+            safe_stop::Release("key u");
+            is_manager_key = true;
             break;
           case 'f':
           case 'F':
@@ -225,10 +263,42 @@ class ZMQManager : public InputInterface {
         }
       }
 
+      // Safe stop: react to a new stop / release (requests may come from any thread)
+      const bool safe_stop_active = safe_stop::Active().load();
+      if (safe_stop_active && !safe_stop_prev_) {
+        rearm_vr_.store(true);
+        // VR hands -> rest pose along a smooth path (from the planner-topic VR hands,
+        // or from the streamed-motion VR hands when in full-body mode)
+        StartLoweringPath(active_mode_ == ManagedMode::STREAMED_MOTION);
+        has_upper_body_control_ = false;
+        has_hand_joints_ = false;
+        if (active_mode_ == ManagedMode::STREAMED_MOTION) {
+          // Same path as a {planner: true} command: SONIC's safety reset to planner idle.
+          TriggerSafetyReset();
+          if (pose_interface_) pose_interface_->TriggerSafetyReset();
+          active_mode_ = ManagedMode::PLANNER;
+          std::cout << "[SafeStop] Streamed motion -> PLANNER idle (safety reset)" << std::endl;
+        }
+      } else if (!safe_stop_active && safe_stop_prev_) {
+        std::cout << "[SafeStop] Robot stays in idle: VR hands / walking resume after the operator leaves and "
+                  << "re-enters teleop; a new start/mode command (button / key) is accepted." << std::endl;
+      }
+      safe_stop_prev_ = safe_stop_active;
+
       // Translate received command to control flags and handle mode switching
       bool trigger_zmq_toggle = false;
       {
         std::lock_guard<std::mutex> lock(command_mutex_);
+        if (latest_command_.valid && safe_stop_active) {
+          // While stopped never switch to streamed motion (commands arriving now are
+          // consumed here; PICO / VLA send commands only on a button / key press, so
+          // the next command after the release is a deliberate re-engage).
+          if (!latest_command_.planner) {
+            latest_command_.planner = true;
+            std::cout << "[SafeStop] Stopped: ignoring switch to streamed motion (press u first)." << std::endl;
+          }
+          latest_command_.start = false;
+        }
         if (latest_command_.valid) {
           // Set control flags (already accumulated in callback)
           if (latest_command_.start) {
@@ -574,6 +644,18 @@ class ZMQManager : public InputInterface {
         }
       }
 
+      // Safe stop: ignore the operator / VLA, stand still (IDLE), no arm/hand targets.
+      // After a release this continues until the operator has left teleop (rearm_vr_).
+      if ((safe_stop::Active().load() || rearm_vr_.load()) && planner_state.enabled && planner_state.initialized) {
+        std::lock_guard<std::mutex> lock(planner_mutex_);
+        has_upper_body_control_ = false;
+        has_hand_joints_ = false;
+        UpdateLoweringPath();  // keeps VR control on the synthetic hands, or off if there were none
+        latest_planner_message_.valid = false;
+        auto current_facing = movement_state_buffer.GetDataWithTime().data->facing_direction;
+        movement_state_buffer.SetData(MovementState(static_cast<int>(LocomotionMode::IDLE),
+                                                    {0.0f, 0.0f, 0.0f}, current_facing, -1.0f, -1.0f));
+      } else
       // Apply planner commands if planner is ready
       if (planner_state.enabled && planner_state.initialized) {
         std::lock_guard<std::mutex> lock(planner_mutex_);
@@ -675,13 +757,26 @@ class ZMQManager : public InputInterface {
       if (hdr.fields.empty() || bufs.empty()) return;
       
       int start_idx = -1, stop_idx = -1, planner_idx = -1;
+      bool has_safe_field = false;
       for (size_t i = 0; i < hdr.fields.size(); ++i) {
+        if (hdr.fields[i].name == "safe_stop" || hdr.fields[i].name == "safe_release") has_safe_field = true;
+        // Optional safe-stop fields (e.g. from a voice-command node): true = trigger.
+        if ((hdr.fields[i].name == "safe_stop" || hdr.fields[i].name == "safe_release") && i < bufs.size() &&
+            bufs[i].size >= 1) {
+          uint8_t v = 0;
+          std::memcpy(&v, bufs[i].data, 1);  // bool / u8, or first byte of i32 (little endian)
+          if (v != 0) {
+            if (hdr.fields[i].name == "safe_stop") safe_stop::Request("command topic");
+            else safe_stop::Release("command topic");
+          }
+        }
         if (hdr.fields[i].name == "start") start_idx = static_cast<int>(i);
         else if (hdr.fields[i].name == "stop") stop_idx = static_cast<int>(i);
         else if (hdr.fields[i].name == "planner") planner_idx = static_cast<int>(i);
       }
       
       if (start_idx < 0 || stop_idx < 0 || planner_idx < 0) {
+        if (has_safe_field) return;  // safe-stop-only message (e.g. voice node): already handled
         std::cerr << "[ZMQManager] Command missing fields (need: start, stop, planner)" << std::endl;
         return;
       }
@@ -796,6 +891,19 @@ class ZMQManager : public InputInterface {
       if (mode_idx < 0 || movement_idx < 0 || facing_idx < 0) {
         std::cerr << "[ZMQManager] Planner missing required fields" << std::endl;
         return;
+      }
+
+      // Safe stop: drop arm / hand / VR targets while stopped, and after a release
+      // until the operator sends a message without VR hands (= left teleop).
+      if (rearm_vr_.load() && !safe_stop::Active().load() && vr_position_idx < 0 && upper_body_position_idx < 0) {
+        rearm_vr_.store(false);
+        synthetic_vr_.store(false);  // hands already at the rest pose -> planner takes over
+        std::cout << "[SafeStop] Operator left teleop: VR / upper-body targets accepted again." << std::endl;
+      }
+      if (safe_stop::Active().load() || rearm_vr_.load()) {
+        vr_position_idx = vr_orientation_idx = vr_compliance_idx = -1;
+        upper_body_position_idx = upper_body_velocity_idx = -1;
+        left_hand_joints_idx = right_hand_joints_idx = -1;
       }
       
       PlannerMessage msg;
@@ -1189,8 +1297,9 @@ class ZMQManager : public InputInterface {
             }
         }
       }
-      else {
+      else if (!(safe_stop::Active().load() || rearm_vr_.load())) {
         // No VR position provided - disable VR 3-point control
+        // (not during a safe stop: then the synthetic lowering path owns the VR targets)
         has_vr_3point_control_ = false;
       }
 
@@ -1223,6 +1332,8 @@ class ZMQManager : public InputInterface {
     std::unique_ptr<ZMQPackedMessageSubscriber> command_subscriber_;
     /// Background subscriber for the planner topic.
     std::unique_ptr<ZMQPackedMessageSubscriber> planner_subscriber_;
+    std::unique_ptr<ZMQPackedMessageSubscriber> safety_subscriber_;  ///< Voice safe stop (own port).
+    std::unique_ptr<safe_stop::StatusPublisher> safe_stop_status_;   ///< Stop state -> BrainCo hand scripts.
     
     // ------------------------------------------------------------------
     // Mode / message state
@@ -1252,6 +1363,64 @@ class ZMQManager : public InputInterface {
     /// Tracks the previous frame's VR-3-point state to detect enable/disable transitions
     /// and automatically toggle encoder mode accordingly.
     bool last_has_vr_3point_control_ = false;
+
+    // ------------------------------------------------------------------
+    // Safe stop: smooth lowering path of the VR hand targets (safe_stop::HandPath)
+    // ------------------------------------------------------------------
+    /// @param from_streamed  VR hands taken from the streamed-motion interface.
+    void StartLoweringPath(bool from_streamed = false) {
+      std::array<double, 9> pos;
+      std::array<double, 12> orn;
+      bool have = false;
+      if (from_streamed && pose_interface_ && pose_interface_->HasVR3PointControl()) {
+        pos = pose_interface_->GetVR3PointPosition().second;
+        orn = pose_interface_->GetVR3PointOrientation().second;
+        have = true;
+      } else if (!from_streamed && has_vr_3point_control_) {
+        auto p = vr_3point_position_.GetDataWithTime().data;
+        auto o = vr_3point_orientation_.GetDataWithTime().data;
+        pos = p ? *p : safe_stop::kRestVRPos;
+        orn = o ? *o : safe_stop::kRestVROrn;
+        have = true;
+      }
+      if (!have) {  // no VR hands (keyboard planner, VLA tokens): planner idle as before
+        synthetic_vr_.store(false);
+        has_vr_3point_control_ = false;
+        std::cout << "[SafeStop] No VR hands to steer: robot goes to planner idle directly." << std::endl;
+        return;
+      }
+      path_.Start(pos, orn, safe_stop::Settings());
+      path_clock_started_ = false;  // starts at the first planner tick (streamed: after the planner is up)
+      synthetic_vr_.store(true);
+      vr_3point_position_.SetData(pos);
+      vr_3point_orientation_.SetData(orn);
+      has_vr_3point_control_ = true;
+      std::cout << "[SafeStop] Hands hold " << path_.delay() << " s (arms soften), then "
+                << (path_.hug() ? "OPEN WIDE and come down (hug)" : "come straight down") << " over "
+                << path_.duration() << " s (path " << path_.length() << " m)" << std::endl;
+    }
+
+    /// Called every input tick while stopped (and until the operator has left teleop).
+    void UpdateLoweringPath() {
+      if (!synthetic_vr_.load()) { has_vr_3point_control_ = false; return; }
+      if (!path_clock_started_) { path_start_ = std::chrono::steady_clock::now(); path_clock_started_ = true; }
+      const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - path_start_).count();
+      std::array<double, 9> pos;
+      std::array<double, 12> orn;
+      path_.Sample(t, pos, orn);
+      vr_3point_position_.SetData(pos);
+      vr_3point_orientation_.SetData(orn);
+      has_vr_3point_control_ = true;
+    }
+
+    std::atomic<bool> synthetic_vr_{false};   ///< VR targets come from the lowering path.
+    safe_stop::HandPath path_;
+    std::chrono::steady_clock::time_point path_start_{};
+    bool path_clock_started_ = false;
+
+    // Safe stop (safe_stop.hpp)
+    bool safe_stop_prev_ = false;             ///< Safe stop state seen last update().
+    std::atomic<bool> rearm_vr_{false};       ///< Block planner-topic targets (VR, arms, walking) until operator leaves teleop.
 };
 
 #endif // ZMQ_MANAGER_HPP
