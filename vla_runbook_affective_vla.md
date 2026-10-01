@@ -126,6 +126,42 @@ python /home/unitree/teleop-ws/Teleop-Inference-WBC/gear_sonic/scripts/run_infer
 
 **Клавиши:** `k` старт → `i` начальная поза (обязательно) → `p` снять паузу (тумблер) → `g` заморозка тела.
 
+### Автоматический prompt от dual-camera predictor
+
+На компьютере с окружением `action` и доступом к камерному серверу робота:
+
+```bash
+cd /home/nikita/Skoltech/ICRA-HRI/dual_camera_robot
+conda activate action
+python -B run_dualcam.py robot \
+  --host 192.168.50.132 \
+  --port 5555 \
+  --device cuda \
+  --intent-bind 'tcp://*:5562' \
+  --print
+```
+
+На роботе запускайте мост с дополнительными параметрами:
+
+```bash
+python gear_sonic/scripts/run_inference_pose_predictor_affective_vla.py \
+  --host 100.64.0.21 \
+  --port 5555 \
+  --camera-host localhost \
+  --camera-port 5555 \
+  --state-zmq-host localhost \
+  --state-zmq-port 5557 \
+  --action-zmq-host localhost \
+  --action-zmq-port 5556 \
+  --embodiment-tag NEW_EMBODIMENT \
+  --prompt none \
+  --intent-mode auto \
+  --intent-host 192.168.50.42 \
+  --intent-port 5562
+```
+
+В auto-режиме `hug`, `handshake` и `no_interaction` переключают prompt (`no_interaction` → `none`). `unknown`, пропавший intent-поток и смена prompt включают safe hold; исполнение возобновляется только после получения VLA chunk для нового `intent_epoch`. Автоматический `fist_bump` по умолчанию запрещён, поскольку текущий predictor не прошёл его validation. Для ручного prompt отправьте `pr hug`/`pr handshake`; для возврата к predictor — `pr auto`.
+
 
 
 
