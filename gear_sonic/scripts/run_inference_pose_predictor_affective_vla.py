@@ -143,9 +143,6 @@ class InferenceConfig:
     intent_unknown_grace: float = 0.3
     """How long a continuous unknown prediction is tolerated before safe hold."""
 
-    intent_allow_fist_bump: bool = False
-    """Allow autonomous fist_bump despite the current predictor's failed validation."""
-
     # BrainCo contact detection
     brainco_contact_position_error_threshold: float = 0.05
     """Minimum command/state position lag used to detect contact."""
@@ -762,7 +759,6 @@ def main(config: InferenceConfig):
         initial_prompt=config.prompt,
         max_age=config.intent_max_age,
         unknown_grace=config.intent_unknown_grace,
-        allow_fist_bump=config.intent_allow_fist_bump,
     )
 
     pause_loop = True
@@ -1044,8 +1040,6 @@ def main(config: InferenceConfig):
                 received_label = intent_event["label"]
                 received_prompt = INTENT_TO_PROMPT.get(received_label)
                 accepted = bool(intent_event["accepted"])
-                if received_label == "fist_bump" and not config.intent_allow_fist_bump:
-                    accepted = False
                 prompt_text = f'"{received_prompt}"' if accepted and received_prompt else "<SAFE HOLD>"
                 print(
                     f"[intent] received seq={intent_event['seq']}: "

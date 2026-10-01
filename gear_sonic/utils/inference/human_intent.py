@@ -80,7 +80,6 @@ class IntentController:
     initial_prompt: str
     max_age: float = 0.5
     unknown_grace: float = 0.3
-    allow_fist_bump: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in {"manual", "auto"}:
@@ -153,10 +152,6 @@ class IntentController:
         self.last_message_monotonic = now
         label = str(event["label"])
         accepted = bool(event.get("accepted", label != "unknown"))
-        if label == "fist_bump" and not self.allow_fist_bump:
-            accepted = False
-            event = dict(event)
-            event["reason"] = "fist_bump is disabled for autonomous execution"
         if not accepted or label == "unknown":
             if self.unknown_since is None:
                 self.unknown_since = now

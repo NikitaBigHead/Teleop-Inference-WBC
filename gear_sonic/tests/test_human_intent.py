@@ -72,17 +72,11 @@ class IntentControllerTest(unittest.TestCase):
         self.assertEqual(controller.mode, "auto")
         self.assertIs(controller.inference_enabled, False)
 
-    def test_fist_bump_is_disabled_by_default(self):
+    def test_fist_bump_is_accepted_like_other_known_intents(self):
         controller = IntentController("auto", "none", unknown_grace=0.0)
         self.assertIs(controller.process_event(event("fist_bump"), now=1.0), True)
-        self.assertIs(controller.inference_enabled, False)
-        self.assertIn("fist_bump is disabled", controller.hold_reason)
-
-        enabled = IntentController(
-            "auto", "none", unknown_grace=0.0, allow_fist_bump=True
-        )
-        self.assertIs(enabled.process_event(event("fist_bump"), now=1.0), True)
-        self.assertEqual(enabled.prompt, "fist_bump")
+        self.assertIs(controller.inference_enabled, True)
+        self.assertEqual(controller.prompt, "fist_bump")
 
     def test_protocol_rejects_unknown_schema_and_label(self):
         with self.assertRaises(ValueError):

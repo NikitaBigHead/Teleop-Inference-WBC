@@ -138,12 +138,22 @@ python -B run_dualcam.py robot \
   --port 5555 \
   --device cuda \
   --intent-bind 'tcp://*:5562' \
+  --hold-hug-on-unknown \
+  --hug-unknown-hold-seconds 3 \
   --print
 ```
 
+Два `hug`-флага опциональны. С ними predictor продолжает публиковать последний подтверждённый `hug` вместо кратковременного `unknown`, но не дольше указанного времени. Любой другой известный класс отменяет удержание.
+
 На роботе запускайте мост с дополнительными параметрами:
 
+# SLEW_MAX=0.015 \
+# SLEW_HAND=0.01 \
+
+
 ```bash
+SLEW_ENABLE=1 \
+HAND_ENABLE=1 \
 python gear_sonic/scripts/run_inference_pose_predictor_affective_vla.py \
   --host 100.64.0.21 \
   --port 5555 \
@@ -160,7 +170,7 @@ python gear_sonic/scripts/run_inference_pose_predictor_affective_vla.py \
   --intent-port 5562
 ```
 
-В auto-режиме `hug`, `handshake` и `no_interaction` переключают prompt (`no_interaction` → `none`). `unknown`, пропавший intent-поток и смена prompt включают safe hold; исполнение возобновляется только после получения VLA chunk для нового `intent_epoch`. Автоматический `fist_bump` по умолчанию запрещён, поскольку текущий predictor не прошёл его validation. Для ручного prompt отправьте `pr hug`/`pr handshake`; для возврата к predictor — `pr auto`.
+В auto-режиме `hug`, `handshake`, `fist_bump` и `no_interaction` переключают prompt (`no_interaction` → `none`). `unknown`, пропавший intent-поток и смена prompt включают safe hold; исполнение возобновляется только после получения VLA chunk для нового `intent_epoch`. Для ручного prompt отправьте `pr hug`/`pr handshake`; для возврата к predictor — `pr auto`.
 
 
 
