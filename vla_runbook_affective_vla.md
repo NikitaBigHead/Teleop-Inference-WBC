@@ -120,7 +120,7 @@ python /home/unitree/teleop-ws/Teleop-Inference-WBC/gear_sonic/scripts/run_infer
   --action-zmq-host localhost \
   --action-zmq-port 5556 \
   --embodiment-tag NEW_EMBODIMENT \
-  --prompt "hug" \
+  --prompt "none" \
   2>&1 | tee ~/bridge_base_$(date +%Y%m%d_%H%M).log
 ```
 
