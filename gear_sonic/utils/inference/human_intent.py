@@ -80,6 +80,7 @@ class IntentController:
     initial_prompt: str
     max_age: float = 0.5
     unknown_grace: float = 0.3
+    unknown_to_none_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in {"manual", "auto"}:
@@ -88,12 +89,19 @@ class IntentController:
             raise ValueError("intent max_age must be positive")
         if self.unknown_grace < 0:
             raise ValueError("intent unknown_grace must be non-negative")
+        if self.unknown_to_none_seconds < 0:
+            raise ValueError("intent unknown_to_none_seconds must be non-negative")
+        if 0 < self.unknown_to_none_seconds <= self.unknown_grace:
+            raise ValueError("intent unknown_to_none_seconds must exceed unknown_grace")
 
         self.prompt = self.initial_prompt
         self.label: str | None = None
         self.epoch = 0
         self.last_message_monotonic: float | None = None
         self.unknown_since: float | None = None
+        self.fallback_unknown_since: float | None = None
+        self.unknown_reason: str | None = None
+        self.unknown_fallback_active = False
         self.inference_enabled = self.mode == "manual"
         self.execution_hold = True
         self.hold_reason = (
@@ -124,6 +132,9 @@ class IntentController:
         self.prompt = prompt
         self.label = None
         self.unknown_since = None
+        self.fallback_unknown_since = None
+        self.unknown_reason = None
+        self.unknown_fallback_active = False
         self.inference_enabled = True
         self._invalidate(f"waiting for manual prompt {prompt!r}")
         return True
@@ -135,6 +146,9 @@ class IntentController:
         self.label = None
         self.last_message_monotonic = None
         self.unknown_since = None
+        self.fallback_unknown_since = None
+        self.unknown_reason = None
+        self.unknown_fallback_active = False
         return self._enter_hold("waiting for human intent")
 
     def restart(self, reason: str) -> bool:
@@ -143,6 +157,37 @@ class IntentController:
             return False
         self._invalidate(reason)
         return True
+
+    def _clear_unknown(self) -> None:
+        self.unknown_since = None
+        self.fallback_unknown_since = None
+        self.unknown_reason = None
+        self.unknown_fallback_active = False
+
+    def _accept_label(self, label: str, reason: str | None = None) -> bool:
+        prompt = INTENT_TO_PROMPT[label]
+        self._clear_unknown()
+        if self.inference_enabled and self.label == label and self.prompt == prompt:
+            return False
+        self.label = label
+        self.prompt = prompt
+        self.inference_enabled = True
+        self._invalidate(reason or f"waiting for VLA chunk for {label}")
+        return True
+
+    def _apply_unknown_fallback(self, now: float) -> bool:
+        if (
+            self.unknown_to_none_seconds <= 0
+            or self.fallback_unknown_since is None
+            or now - self.fallback_unknown_since < self.unknown_to_none_seconds
+        ):
+            return False
+        changed = self._accept_label(
+            "no_interaction",
+            "waiting for VLA chunk for no_interaction (unknown fallback)",
+        )
+        self.unknown_fallback_active = True
+        return changed
 
     def process_event(self, event: Mapping[str, Any], now: float) -> bool:
         """Apply one validated event. Return whether the epoch changed."""
@@ -153,28 +198,34 @@ class IntentController:
         label = str(event["label"])
         accepted = bool(event.get("accepted", label != "unknown"))
         if not accepted or label == "unknown":
+            if self.unknown_fallback_active:
+                return False
             if self.unknown_since is None:
                 self.unknown_since = now
+            reason = str(event.get("reason", "unknown")) or "unknown"
+            self.unknown_reason = reason
+            if self.fallback_unknown_since is None:
+                self.fallback_unknown_since = now
+            if self._apply_unknown_fallback(now):
+                return True
             if now - self.unknown_since >= self.unknown_grace:
-                reason = str(event.get("reason", "unknown")) or "unknown"
                 return self._enter_hold(f"intent rejected: {reason}")
             return False
 
-        self.unknown_since = None
-        prompt = INTENT_TO_PROMPT[label]
-        if self.inference_enabled and self.label == label and self.prompt == prompt:
-            return False
-
-        self.label = label
-        self.prompt = prompt
-        self.inference_enabled = True
-        self._invalidate(f"waiting for VLA chunk for {label}")
-        return True
+        return self._accept_label(label)
 
     def tick(self, now: float) -> bool:
         """Apply time-based unknown and publisher-staleness transitions."""
         if self.mode != "auto":
             return False
+        if self.last_message_monotonic is None:
+            return False
+        if now - self.last_message_monotonic > self.max_age:
+            self.fallback_unknown_since = None
+            self.unknown_fallback_active = False
+            return self._enter_hold("human intent stream is stale")
+        if self._apply_unknown_fallback(now):
+            return True
         if self.unknown_since is not None and now - self.unknown_since >= self.unknown_grace:
             if (
                 not self.inference_enabled
@@ -182,11 +233,8 @@ class IntentController:
                 and self.hold_reason.startswith("intent rejected:")
             ):
                 return False
-            return self._enter_hold("intent rejected: unknown")
-        if self.last_message_monotonic is None:
-            return False
-        if now - self.last_message_monotonic > self.max_age:
-            return self._enter_hold("human intent stream is stale")
+            reason = self.unknown_reason or "unknown"
+            return self._enter_hold(f"intent rejected: {reason}")
         return False
 
     def accept_result(self, epoch: int) -> bool:

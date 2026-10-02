@@ -62,8 +62,6 @@ chmod 777 ./start_brainco_and_check.sh
 export TensorRT_ROOT="$HOME/TensorRT"
 cd ~/GR00T-WholeBodyControl/gear_sonic_deploy && source scripts/setup_env.sh
 ./deploy.sh \
-  --cp policy/sonic_v1_1/model \
-  --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
   --motor-kp-scale 15-28=0.6 \
   --motor-kd-scale 15-28=0.83 \
@@ -145,20 +143,86 @@ python /home/unitree/teleop-ws/Teleop-Inference-WBC/gear_sonic/scripts/run_infer
 
 ### Автоматический prompt от dual-camera predictor
 
-На компьютере с окружением `action` и доступом к камерному серверу робота:
+На компьютере с доступом к камерному серверу робота выберите predictor при запуске. Все три варианта публикуют одинаковый протокол на `tcp://*:5562`, поэтому команда VLA на роботе от модели не зависит:
 
 ```bash
-cd /home/nikita/Skoltech/ICRA-HRI/dual_camera_robot
+cd /home/nikita/Skoltech/ICRA-HRI/Teleop-Inference-WBC
 conda activate action
-python -B run_dualcam.py robot \
+./gear_sonic/scripts/run_dualcam_intent.sh v1 \
   --host 192.168.50.132 \
   --port 5555 \
   --device cuda \
-  --intent-bind 'tcp://*:5562' \
+  --hug-stable-frames 2 \
+  --handshake-stable-frames 3 \
+  --fist-bump-stable-frames 2 \
+  --no-interaction-stable-frames 5 \
   --hold-hug-on-unknown \
-  --hug-unknown-hold-seconds 3 \
+  --hug-unknown-hold-seconds 5 \
   --print
 ```
+
+Для v2 меняется только первый аргумент:
+
+```bash
+cd /home/nikita/Skoltech/ICRA-HRI/Teleop-Inference-WBC
+conda activate action
+./gear_sonic/scripts/run_dualcam_intent.sh v2 \
+  --host 192.168.50.132 \
+  --port 5555 \
+  --device cuda \
+  --hug-min-confidence 0.50 \
+  --handshake-min-confidence 0.95 \
+  --fist-bump-min-confidence 0.95 \
+  --no-interaction-min-confidence 0.15 \
+  --hug-stable-frames 4 \
+  --handshake-stable-frames 4 \
+  --fist-bump-stable-frames 4 \
+  --no-interaction-stable-frames 2 \
+  --hold-hug-on-unknown \
+  --hug-unknown-hold-seconds 3 \
+  --intent-unknown-grace 1.5 \
+  --intent-unknown-to-none-seconds 4.0 \
+  --intent-max-age 1.5 \
+  --print
+```
+
+Для RGB-модели TinyViT + VideoLightFormer используется selector `video`.
+Необходимые `torchvision 0.22.1+cu128` и `timm 1.0.9` установлены в окружение
+`action`, поэтому используется то же активированное окружение:
+
+```bash
+cd /home/nikita/Skoltech/ICRA-HRI/Teleop-Inference-WBC
+conda activate action
+./gear_sonic/scripts/run_dualcam_intent.sh video \
+  --host 192.168.50.132 \
+  --port 5555 \
+  --device cuda \
+  --hug-min-confidence 0.60 \
+  --handshake-min-confidence 0.60 \
+  --fist-bump-min-confidence 0.60 \
+  --no-interaction-min-confidence 0.60 \
+  --hug-stable-frames 2 \
+  --handshake-stable-frames 3 \
+  --fist-bump-stable-frames 2 \
+  --no-interaction-stable-frames 5 \
+  --hold-hug-on-unknown \
+  --hug-unknown-hold-seconds 3 \
+  --intent-unknown-grace 1.5 \
+  --intent-unknown-to-none-seconds 4.0 \
+  --intent-max-age 1.5 \
+  --print
+```
+
+RGB-модель работает на 15 Гц, поэтому `2/3/2/5` означает примерно
+0.07/0.13/0.07/0.27 с подтверждения после первого кандидата. Её confidence
+откалиброван отдельно от pose-моделей; начинайте с checkpoint threshold 0.60,
+а не копируйте автоматически пороги v2.
+
+Launcher ищет соседние каталоги `dual_camera_robot`, `dual_camera_robot_v2` и `hri_video_robot`. Если workspace расположен иначе, задайте `ICRA_HRI_ROOT=/путь/к/ICRA-HRI`; для pose-моделей интерпретатор выбирается через `PYTHON_BIN`, для RGB-модели — через `HRI_VIDEO_PYTHON_BIN`. Для переключения нажмите `Ctrl+C` у текущей версии и запустите другую. Не запускайте predictors одновременно: второй процесс не сможет занять порт 5562. VLA перезапускать не требуется — на время разрыва intent-потока он переходит в safe hold, затем ждёт свежий chunk для нового prompt.
+
+У каждой задачи есть независимый минимальный confidence: `--hug-min-confidence`, `--handshake-min-confidence`, `--fist-bump-min-confidence`, `--no-interaction-min-confidence`. Общий `--threshold` остаётся fallback для незаданных классов; без него используется порог checkpoint (v1: 0.40, v2: 0.25, video: 0.60). Значения нужно подбирать отдельно для каждой модели по её логам.
+
+Число последовательных валидных решений тоже задаётся отдельно: `--hug-stable-frames`, `--handshake-stable-frames`, `--fist-bump-stable-frames`, `--no-interaction-stable-frames`. Pose-модели принимают решения при 5 Гц, video — при 15 Гц, поэтому одинаковое число frames означает разную задержку. Пока новый класс не набрал нужную серию, predictor публикует `unknown` с причиной `unstable_prediction`; чтобы VLA сохранила текущий prompt в этот период, используйте `--intent-unknown-grace 1.5`.
 
 Два `hug`-флага опциональны. С ними predictor продолжает публиковать последний подтверждённый `hug` вместо кратковременного `unknown`, но не дольше указанного времени. Любой другой известный класс отменяет удержание.
 
@@ -198,7 +262,9 @@ python gear_sonic/scripts/run_inference_pose_predictor_affective_vla.py \
   --compliance-rate 10
 ```
 
-В auto-режиме `hug`, `handshake`, `fist_bump` и `no_interaction` переключают prompt (`no_interaction` → `none`). `unknown`, пропавший intent-поток и смена prompt включают safe hold; исполнение возобновляется только после получения VLA chunk для нового `intent_epoch`. Для ручного prompt отправьте `pr hug`/`pr handshake`; для возврата к predictor — `pr auto`.
+В auto-режиме `hug`, `handshake`, `fist_bump` и `no_interaction` переключают prompt (`no_interaction` → `none`). При непрерывном `unknown` старый prompt сохраняется в течение `--intent-unknown-grace` (здесь 1.5 с), затем включается safe hold. Если живой predictor продолжает публиковать `unknown` в течение `--intent-unknown-to-none-seconds` (здесь 4 с), bridge считает это `no_interaction`, переключает prompt на `none` и держит робота до получения свежего VLA chunk для `none`. Последующий непрерывный `unknown` остаётся `no_interaction`, не создавая повторных циклов hold. Значение `0` отключает этот fallback. Любой известный класс сбрасывает оба таймера и это состояние.
+
+`--intent-max-age` имеет другое назначение: это допустимый возраст последнего сообщения. Если predictor или сеть пропали, поток считается stale, fallback в `none` не выполняется и робот остаётся в safe hold. Для ручного prompt отправьте `pr hug`/`pr handshake`; для возврата к predictor — `pr auto`.
 
 `--intent-compliance` поднимает PUB на `tcp://*:5565`, немедленно отправляет профиль при подготовке нового prompt и повторяет его с частотой `--compliance-rate`. Исполнение остаётся в safe hold до свежего VLA chunk, поэтому профиль успевает начать плавный переход раньше движения. Не запускайте одновременно `arm_compliance_cli.py`: он тоже пытается занять порт 5565. В логе bridge ожидается `Arm compliance -> HANDSHAKE/HUG/FISTBUMP_SOFTWRIST`, в deploy — `[ArmCompliance] -> ...`.
 

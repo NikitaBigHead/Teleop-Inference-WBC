@@ -145,6 +145,9 @@ class InferenceConfig:
     intent_unknown_grace: float = 0.3
     """How long a continuous unknown prediction is tolerated before safe hold."""
 
+    intent_unknown_to_none_seconds: float = 0.0
+    """Convert continuous unknown to no_interaction after this many seconds; 0 disables."""
+
     intent_compliance: bool = False
     """Switch C++ arm-compliance profiles when a new VLA prompt starts executing."""
 
@@ -774,6 +777,7 @@ def main(config: InferenceConfig):
         initial_prompt=config.prompt,
         max_age=config.intent_max_age,
         unknown_grace=config.intent_unknown_grace,
+        unknown_to_none_seconds=config.intent_unknown_to_none_seconds,
     )
 
     pause_loop = True

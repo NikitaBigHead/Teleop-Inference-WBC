@@ -78,6 +78,97 @@ class IntentControllerTest(unittest.TestCase):
         self.assertIs(controller.inference_enabled, True)
         self.assertEqual(controller.prompt, "fist_bump")
 
+    def test_unknown_holds_then_falls_back_to_none(self):
+        controller = IntentController(
+            "auto",
+            "none",
+            max_age=10.0,
+            unknown_grace=1.5,
+            unknown_to_none_seconds=4.0,
+        )
+        controller.process_event(event("fist_bump"), now=0.0)
+        controller.accept_result(controller.epoch)
+
+        controller.process_event(
+            event("unknown", accepted=False, reason="low_action_confidence"),
+            now=0.1,
+        )
+        self.assertEqual(controller.prompt, "fist_bump")
+        self.assertIs(controller.execution_hold, False)
+
+        self.assertIs(controller.tick(now=1.7), True)
+        self.assertIs(controller.execution_hold, True)
+        self.assertIs(controller.inference_enabled, False)
+
+        controller.process_event(
+            event("unknown", accepted=False, reason="unstable_prediction"),
+            now=4.2,
+        )
+        self.assertEqual(controller.label, "no_interaction")
+        self.assertEqual(controller.prompt, "none")
+        self.assertIs(controller.inference_enabled, True)
+        self.assertIs(controller.execution_hold, True)
+        self.assertIn("unknown fallback", controller.hold_reason)
+
+        fallback_epoch = controller.epoch
+        self.assertIs(controller.accept_result(fallback_epoch), True)
+        controller.process_event(
+            event("unknown", accepted=False, reason="no_person"), now=4.4
+        )
+        controller.tick(now=6.0)
+        self.assertEqual(controller.label, "no_interaction")
+        self.assertEqual(controller.prompt, "none")
+        self.assertIs(controller.inference_enabled, True)
+        self.assertIs(controller.execution_hold, False)
+
+    def test_no_person_also_falls_back_to_none_when_stream_is_alive(self):
+        controller = IntentController(
+            "auto",
+            "none",
+            max_age=10.0,
+            unknown_grace=1.5,
+            unknown_to_none_seconds=4.0,
+        )
+        controller.process_event(event("hug"), now=0.0)
+        controller.accept_result(controller.epoch)
+        controller.process_event(
+            event("unknown", accepted=False, reason="no_person"), now=0.1
+        )
+        controller.process_event(
+            event("unknown", accepted=False, reason="no_person"), now=5.0
+        )
+        self.assertEqual(controller.label, "no_interaction")
+        self.assertEqual(controller.prompt, "none")
+        self.assertIs(controller.inference_enabled, True)
+        self.assertIn("unknown fallback", controller.hold_reason)
+
+    def test_stale_stream_takes_priority_over_unknown_fallback(self):
+        controller = IntentController(
+            "auto",
+            "none",
+            max_age=0.5,
+            unknown_grace=0.3,
+            unknown_to_none_seconds=4.0,
+        )
+        controller.process_event(event("fist_bump"), now=0.0)
+        controller.accept_result(controller.epoch)
+        controller.process_event(
+            event("unknown", accepted=False, reason="unstable_prediction"),
+            now=0.1,
+        )
+        controller.tick(now=5.0)
+        self.assertEqual(controller.label, "fist_bump")
+        self.assertEqual(controller.hold_reason, "human intent stream is stale")
+
+    def test_unknown_fallback_timeout_must_exceed_grace(self):
+        with self.assertRaises(ValueError):
+            IntentController(
+                "auto",
+                "none",
+                unknown_grace=1.5,
+                unknown_to_none_seconds=1.5,
+            )
+
     def test_protocol_rejects_unknown_schema_and_label(self):
         with self.assertRaises(ValueError):
             validate_intent_event(
